@@ -1,6 +1,122 @@
-# To do list
+# To do lists
 
-/// TODO: Use alloca when we can
+## Virtual machine
+[x] Compile to stack based language
+[x] Execute in stack based language
+[x] Unify imports and constants
+[x] Virtual stack
+[x] Remove the stack
+[x] Seperate numbering for constants, closures, arguments and allocs
+[x] Promote constant allocs to constant closures
+[x] Add address_t type and use it
+[x] Inline functions
+[x] Fixed-point constant finding and inlining
+[x] Global list of constants
+[x] Deduplicated constants
+[x] Remove unused allocs
+[x] Reference counting memory manager
+[x] Explicit reference count instructions
+[x] Explicit reference counting (instead of std::shared_ptr)
+[x] Allocate closures as header + values
+[x] Remove unused functions
+[x] Remove unused closure values
+[x] Inline calls to allocs
+[x] Remove unused closure places
+[x] Deduplicate allocs
+[x] Compile to assembler (see teensy.asm)
+[x] Implement assembler mem_alloc
+[x] Implement assemble mem_unpack
+[x] Generate refs
+[x] Fix register assignment order for arguments to arguments
+[x] Recursive assembler mem_unpack
+[x] Recursive assembler mem_deref
+[x] Simple free-list allocator, fixed size, using sys_brk
+[x] Clear rsi on first ref only
+[x] Direct jmp when target func is known (const, alloc)
+[x] Allocate memory in chunks of one megabyte (to avoid many sys_brk)
+[x] Remove function_table indirection
+[x] Abolish all conventional use of stack
+[x] Pass closures in rsp on call
+[x] Use scratch memory for reg save/restore instead of stack
+[x] mem_alloc returns new closure in rsp
+[x] Set alloc refcount on alloc
+[x] closure-in-registers calling mode
+
+[ ] Port to AsmJit
+
+[ ] Alloc of function calling a closure argument, can be inlined?
+
+[ ] Static analysis starting from main
+
+[ ] https://stackoverflow.com/questions/43184660/how-is-coqs-parser-implemented
+
+[ ] http://gallium.inria.fr/blog/ssa-cps-reading-notes/
+[ ] Statically analyse possible functions at tail call site
+[ ] Statically analyse closure life-times
+[ ] Control flow analysis, to find more constants
+[ ] Staticaly infer bounds on reference counts
+[ ] Statically allocate closures that exist at most once
+[ ] Fix terminology (closure, function, procedure, state, routine, continuation, callbacks, ..?)
+[ ] Re-use own closure if it matches an alloc in size
+[ ] Re-use closure objects (ie try to elliminate free-1 alloc-1 pairs)
+[ ] Specialize functions of constant closures by inlining to get constant empty closures
+[ ] Unrecurse mem_deref
+[ ] Shuffle call arguments by finding cycle decompositions and using xchg
+[ ] Refcount before closure (ie offset pointers by two)
+[ ] Generate mem_*_n functions and alloc size based on maximum closure size
+[ ] Have unrolled mem_unpack_n and mem_deref_n functions
+[ ] Calling convention passing closure arguments in registers
+[ ] Skip setting closure pointer when calling funcs with constant empty closures
+[ ] Use rsp to point to closures, use ret to jump to them, pop to unpack them
+[ ] Deduplicate functions (Is there a unique reduced form?)
+[ ] Inline memory
+[ ] Handle overflow in assembler ref
+[ ] Implement assembler read
+[ ] Allocate memory using syscalls
+[ ] Implement fixed-size pool allocators with free-lists
+[ ] Abuse rsp, push and pop for memory management
+[ ] Benchmarking per closure, histogram per function
+[ ] Promote closure alllocs to closure values (closure-inlining)
+[ ] Investigate different memory allocation strategies
+
+## Language
+[ ] Add read intrinsic, similar to print for write
+[ ] Add intrinsics for string processing
+[ ] Add file handles for read/write
+[ ] Add Linux syscall mechanism
+[ ] Add proof language
+[ ] Code over multiple files
+[ ] Mechanism for code modules
+
+# Calling convention
+
+Arguments are passed in registers, if there are not enough registers, the
+remaining arguments are passed through static global variables. Since we know
+in advance what the the maximum number of arguments is going to be, we can
+allocate this array staticall (if required at all).
+
+If the function has a non-empty closure, a pointer to the closure is passed as
+the first argument.
+
+Idea: pass the closure values in registers as well.
+
+Idea: Re-order arguments such that at runtime, the minimum amount of register
+shuffling is required. Use profiling data to determine how to order.
+
+Idea: Re-order functions such that fall-through instead of a jump to share code
+between an inlined function and the un-inlined version (at least for one
+location where it is inlined). Use profiling data to determine which function.
+
+Idea: Provide a native "syscall" function, use this to implement an stdlib.
+http://syscalls.kernelgrok.com/
+See teensy.asm
+
+Reading list:
+* https://en.wikipedia.org/wiki/Dominator_(graph_theory)
+* https://en.wikipedia.org/wiki/Static_single_assignment_form
+* https://en.wikipedia.org/wiki/Continuation-passing_style
+
+This is similar to how Jonesforth operates: http://git.annexia.org/?p=jonesforth.git;a=blob;f=jonesforth.S
 
 /// TODO: Background thread to analyse the performance oprofile style
 /// TODO: Background thread to dynamically optimize code
@@ -55,7 +171,7 @@ This gives four kinds of functions
 
 
 // Boolean edges as truth values
-// Theorems as 
+// Theorems as
 
 // Implement boolean values as:
 // True a b ↦ a
@@ -138,7 +254,7 @@ They can be implemented as unspecified propositions: IsInteger(n). Dependent typ
 TODO: Performance characteristics:
 
 slowdiv n m ↦ q r
-	complexity.time slowdiv log(n) + log(m) 
+	complexity.time slowdiv log(n) + log(m)
 	complexity.memory slowdiv 2 * m
 
 
@@ -158,11 +274,10 @@ TODO: Allow syntax modifications in language:
 Lexer -> Preprocessor -> Parser
 Lexer: Chunk source into identifiers
 Preprocessor: resolve scoping and references
-Parser: 
+Parser:
 
 
 [parse rule:  #1 + #2 ↦ (. ≔ plus #1 #2) ]
 [parse rule:  if #1 then #2 else #3  ↦ (≔(≔if #1 (↦ #2) (↦#3))) ]
 [parse rule:  /#1/ ↦ ( . ≔  regexp_parse("#3") ) ]
 etc…
-

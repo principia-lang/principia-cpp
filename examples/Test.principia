@@ -1,0 +1,5 @@
+λ f a ret
+	g a (λ ·)
+	h a (λ ·)
+	ret
+

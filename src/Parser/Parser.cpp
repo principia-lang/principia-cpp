@@ -1,379 +1,608 @@
 #include "Parser.h"
-#include <QuexParser.hpp>
-#include <DFG/ConstantProperty.h>
-#include <Parser/SourceProperty.h>
-#include <Parser/IdentifierProperty.h>
-#include <Utilities/exceptions.h>
-#include <Unicode/exceptions.h>
 #include <Unicode/convert.h>
+#include <Unicode/exceptions.h>
+#include <vector>
 #include <sstream>
 #include <fstream>
-#include <iostream>
-using std::wcerr;
-using std::endl;
+#include <functional>
+#include <limits>
+#include <algorithm>
 
-#define debug false
+// TODO: Make `Symbol` and uint instead of a pair.
 
-Parser::Parser()
-: _token(nullptr)
-, _unread(false)
+namespace Parser {
+
+typedef std::vector<std::shared_ptr<Node>> Stack;
+
+std::shared_ptr<Node> lexer(std::wistream& stream)
 {
-}
-
-Parser& Parser::parseFile(const string& filename)
-{
-	_filename = filename;
-	std::ifstream stream(encodeLocal(_filename));
-	if(!stream.is_open())
-		throw runtime_error(L"Could not open file.");
-	return parse(stream);
-}
-
-Parser& Parser::parse(const std::string& bytes)
-{
-	std::istringstream stream{bytes};
-	return parse(stream);
-}
-
-Parser& Parser::parse(const string& contents)
-{
-	// The parser is hard-wired for UTF-8
-	return parse(encodeUtf8(contents));
-}
-
-Parser& Parser::parse(std::istream& stream)
-{
-	_parser = new quex::QuexParser(&stream, "utf8");
-	readNext();
-	_tree = parseFile();
-	delete _parser;
-	return *this;
-}
-
-void Parser::readNext()
-{
-	if(_unread) {
-		_unread = false;
-		return;
-	}
+	Stack stack;
+	uint indentation_depth = 0;
+	uint statement_depth = 0;
 	
-	_parser->receive(&_token);
+	// TOKEN: BEGIN MODULE
+	//std::wcerr << "BEGIN MODULE\n";
+	stack.push_back(std::make_shared<Node>(Module));
 	
-	if(debug) {
-		// Debug print token
-		wcerr << "TOKEN: ";
-		wcerr << decodeLocal(_token->type_id_name());
-		wcerr << " at ";
-		wcerr << _token->line_number() << L":";
-		wcerr << _token->column_number();
-		if(_token->type_id() == TokenIdentifier)
-			wcerr << L"\t"<<  _token->pretty_wchar_text();
-		wcerr << endl;
-	}
-}
-
-void Parser::unread()
-{
-	assert(_unread == false);
-	_unread = true;
-}
-
-uint32 Parser::token()
-{
-	return _token->type_id();
-}
-
-string Parser::lexeme()
-{
-	return _token->pretty_wchar_text();
-	// return decodeUtf8(reinterpret_cast<const char*>(_token->get_text().c_str()));
-}
-
-SourceProperty Parser::source(bool hasLexeme)
-{
-	int fromLine = _token->line_number();
-	int fromColumn = _token->column_number();
-	int toLine = fromLine;
-	int toColumn = fromColumn;
-	if(hasLexeme)
-		toColumn += lexeme().size() - 1;
-	return SourceProperty(_filename, fromLine, fromColumn, toLine, toColumn);
-}
-
-void Parser::parseFailure(string location)
-{
-	wcerr << decodeLocal(_token->type_id_name()) << endl;
-	wcerr << L"parseFailure" << endl;
-	SourceProperty s = source();
-	if(location.empty())
-		wcerr << endl << s << L": Syntax error." << endl;
-	else
-		wcerr << endl << s << L": Syntax error in " << location << "." << endl;
-	s.printCaret(wcerr);
-	throw L"Syntax error.";
-}
-
-ParseTree* Parser::parseFile()
-{
-	ParseTree* tree = new ParseTree;
-	for(;;readNext()) switch(token()) {
-	case TokenStatementSeparator: continue;
-	case TokenBlockBegin: tree->top()->appendChild(parseScope()); continue;
-	case TokenIdentifier: tree->top()->appendChild(parseStatement()); continue;
-	case TokenEndOfStream: return tree;
-	default: parseFailure(L"file"); delete tree; return 0;
-	}
-}
-
-ParseTree::Scope* Parser::parseScope()
-{
-	// Eat the block begin
-	assert(token() == TokenBlockBegin);
-	readNext();
-	
-	// Parse the scope
-	ParseTree::Scope* scope = new ParseTree::Scope;
-	scope->source(source(false));
-	for(;;readNext()) switch(token()) {
-	case TokenStatementSeparator: continue;
-	case TokenBlockBegin: scope->appendChild(parseScope()); continue;
-	case TokenIdentifier:
-	case TokenCall:
-	case TokenClosure:
-	case TokenBecause:
-	case TokenAxiom:
-	case TokenProofs:
-	case TokenTherefore:
-		scope->appendChild(parseStatement());
-		continue;
-	case TokenBlockEnd: return scope;
-	default: parseFailure(L"scope"); delete scope; return 0;
-	}
-}
-
-ParseTree::Statement* Parser::parseStatement()
-{
-	ParseTree::Statement* statement = new ParseTree::Statement;
-	statement->source(source(false));
-	
-	// Parse the out identifiers
-	while(token() == TokenIdentifier) {
-		statement->addOut(parseIdentifier());
-		readNext();
-	}
-	
-	// Parse the statement type
-	switch(token()) {
-		case TokenCall: statement->type(ParseTree::Statement::Call); break;
-		case TokenClosure: statement->type(ParseTree::Statement::Closure); break;
-		case TokenBecause: statement->type(ParseTree::Statement::Precondition); break;
-		case TokenAxiom: statement->type(ParseTree::Statement::Axiom); break;
-		case TokenProofs: statement->type(ParseTree::Statement::Assertion); break;
-		case TokenTherefore: statement->type(ParseTree::Statement::Postcondition); break;
-		default: parseFailure(L"statement type"); delete statement; return 0;
-	}
-	readNext();
-	
-	// Parse the in expressions
-	for(;;readNext()) switch(token()) {
-	case TokenIdentifier: statement->addIn(parseIdentifier()); continue;
-	case TokenBracketOpen: statement->addIn(parseInlineStatement()); continue;
-	case TokenNumber: statement->addIn(parseNumber()); continue;
-	case TokenQuotation: statement->addIn(parseQuotation()); continue;
-	case TokenBlockBegin:
-	case TokenBlockEnd: unread();
-	case TokenStatementSeparator: return statement;
-	default: parseFailure(L"statement inputs"); delete statement; return 0;
-	}
-}
-
-ParseTree::Statement* Parser::parseInlineStatement()
-{
-	ParseTree::Statement* statement = new ParseTree::Statement;
-	statement->source(source(false));
-	
-	// Eat the bracker open
-	assert(token() == TokenBracketOpen);
-	readNext();
-	
-	// Parse the out identifiers
-	while(token() == TokenIdentifier || token() == TokenBracketValue) {
-		// parseIdentifier will also work on TokenBracketValue
-		statement->addOut(parseIdentifier());
-		readNext();
-	}
-	
-	// Parse the statement type
-	switch(token()) {
-		case TokenCall: statement->type(ParseTree::Statement::Call); break;
-		case TokenClosure: statement->type(ParseTree::Statement::Closure); break;
-		default: parseFailure(L"inline statement type"); delete statement; return nullptr;
-	}
-	readNext();
-	
-	// Parse the in expressions
-	for(;;readNext()) switch(token()) {
-	case TokenIdentifier: statement->addIn(parseIdentifier()); continue;
-	case TokenBracketOpen: statement->addIn(parseInlineStatement()); continue;
-	case TokenNumber: statement->addIn(parseNumber()); continue;
-	case TokenQuotation: statement->addIn(parseQuotation()); continue;
-	case TokenBracketClose: return statement;
-	default: parseFailure(L"inline statement inputs"); delete statement; return nullptr;
-	}
-}
-
-ParseTree::Identifier* Parser::parseIdentifier()
-{
-	ParseTree::Identifier* id = new ParseTree::Identifier;
-	id->source(source(true));
-	id->name(lexeme());
-	return id;
-}
-
-ParseTree::Constant* Parser::parseNumber()
-{
-	// For radices up to and including 36 the following digits are used:
-	const string digits = L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-	
-	// Todo:
-	//
-	// For radices up to and including 64 the following digits are used:
-	//
-	// ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
-	//
-	// The digits ‘-’ and ‘_’ can also be used and are equivalent to ‘+’ and ‘/’
-	// respectively. Any trailing ‘=’ characters are ignored. This is digit set
-	// is compatible with the most common base64 implementations.
-	//
-	// Note that the result is interpreted as a number, and not as a sequence of
-	// bytes as is customary with base64.
-	
-	const wchar_t separator = L'\u2009';
-	const wchar_t radixPoint = L'.';
-	const string baseDigits = L"₀₁₂₃₄₅₆₇₈₉";
-	const string exponentDigits = L"⁰¹²³⁴⁵⁶⁷⁸⁹";
-	const wchar_t exponentPositive = L'⁺';
-	const wchar_t  exponentNegative = L'⁻';
-	
-	string litteral = _token->pretty_wchar_text();
-	uint64 mantissa;
-	int base;
-	int exponent;
-	
-	// Find a base if we got one
-	size_t baseStart = litteral.find_first_of(baseDigits);
-	if(baseStart != string::npos) {
-		// Read the base
-		size_t basePos = baseStart;
-		base = 0;
-		for(;;) {
-			size_t digit = baseDigits.find_first_of(litteral[basePos]);
-			if(digit == string::npos)
-				break;
-			base *= 10;
-			base += digit;
-			basePos++;
-			if(basePos == litteral.size())
-				break;
-		}
-		if(basePos < litteral.size()) {
-			// Read the exponent sign if its there
-			int expSign = 1;
-			if(litteral[basePos] == exponentPositive) basePos++;
-			else if(litteral[basePos] == exponentNegative) {
-				expSign = -1;
-				basePos++;
+	while(stream.good()) {
+		wchar_t c = stream.get();
+		
+		// Statements separator and indentation
+		if(c == statement_separator) {
+			// All sub statements must be closed
+			if(statement_depth > 1) {
+				throw runtime_error(L"Missing )");
+			} else if(statement_depth == 1) {
+				
+				// TOKEN: END STATEMENT
+				//std::wcerr << "END STATEMENT\n";
+				assert(stack.back()->kind == Statement);
+				stack.pop_back();
+				statement_depth = 0;
+				
 			}
 			
-			// Read the rest of the exponent
-			exponent = 0;
-			for(; basePos < litteral.size(); ++basePos) {
-				size_t digit = exponentDigits.find_first_of(litteral[basePos]);
-				if(digit == string::npos)
-					throw "Syntax error in number";
-				exponent *= 10;
-				exponent += digit;
+			// Indentation mode:
+			uint new_identation_depth = 0;
+			while(stream.peek() == indentation) {
+				++new_identation_depth;
+				stream.get();
 			}
-			exponent *= expSign;
-		} else
-			exponent = 0;
-	} else {
-		baseStart = litteral.size();
-		base = 10;
-		exponent = 0;
-	}
-	
-	// Find the rest of the digits
-	mantissa = 0;
-	int separators = 0;
-	bool seenPoint = false;
-	for(size_t i = 0; i < baseStart; ++i) {
-		if(litteral[i] == separator) {
-			++separators;
-			continue;
-		}
-		if(litteral[i] == radixPoint) {
-			assert(!seenPoint);
-			seenPoint = true;
-			separators = 0;
-			exponent -= baseStart - i - 1;
-			continue;
-		}
-		size_t digit = digits.find_first_of(litteral[i]);
-		if(digit >= base)
-			throw "Syntax error in number";
-		mantissa *= base;
-		mantissa += digit;
-	}
-	if(seenPoint)
-		exponent += separators;
-	
-	// Set a real or integer constant based on the radix point
-	ParseTree::Constant* constant = nullptr;
-	if(seenPoint) {
-		double value = mantissa * pow(base, exponent);
-		constant = new ParseTree::Constant(Value{value});
-	} else {
-		sint64 value = mantissa;
-		uint64 squares = base;
-		assert(exponent >= 0);
-		while(exponent) {
-			if(exponent & 1)
-				value *= squares;
-			squares *= squares;
-			exponent >>= 1;
-		}
-		constant = new ParseTree::Constant(Value{value});
-	}
-	constant->source(source(true));
-	return constant;
-}
-
-ParseTree::Constant* Parser::parseQuotation()
-{
-	string contents = lexeme();
-	
-	// Count line and column number
-	int num_lines = 0;
-	int toColumn = 1;
-	for(int i = 0; i != contents.size(); ++i) {
-		if(contents[i] == (L'\n')) {
-			++num_lines;
-			toColumn = 1;
+			// wcerr << "INDENTATION " << new_identation_depth << "\n";
+			if(new_identation_depth > indentation_depth + 1) {
+				throw runtime_error(L"Can not open more than one scope at a time.");
+			} else if(new_identation_depth == indentation_depth + 1) {
+				// TOKEN: BEGIN SCOPE
+				//std::wcerr << "BEGIN SCOPE\n";
+				assert(stack.back()->kind == Module || stack.back()->kind == Scope);
+				stack.back()->children.push_back(std::make_shared<Node>(Scope));
+				stack.push_back(stack.back()->children.back());
+				++indentation_depth;
+			} else if(new_identation_depth == indentation_depth) {
+				// Same scope
+			} else {
+				while(new_identation_depth < indentation_depth) {
+					// TOKEN: END SCOPE
+					//std::wcerr << "END SCOPE\n";
+					assert(stack.back()->kind == Scope);
+					stack.pop_back();
+					--indentation_depth;
+				}
+			}
+		} else if(c == indentation) {
+			throw runtime_error(L"Can not have indentation here.");
+		
+		} else if(c == identifier_separator) {
+			// Nothing
+		
+		// Substatements
+		} else if(c == substatement_begin) {
+			
+			if(statement_depth == 0) {
+				// TOKEN: BEGIN STATEMENT
+				//std::wcerr << "BEGIN STATEMENT\n";
+				assert(stack.back()->kind == Module || stack.back()->kind == Scope);
+				assert(statement_depth == 0);
+				stack.back()->children.push_back(std::make_shared<Node>(Statement));
+				stack.push_back(stack.back()->children.back());
+				statement_depth = 1;
+			}
+			
+			// TOKEN: BEGIN SUBSTATEMENT
+			//std::wcerr << "BEGIN SUB-STATEMENT\n";
+			assert(stack.back()->kind == Statement || stack.back()->kind == SubStatement);
+			assert(statement_depth >= 1);
+			stack.back()->children.push_back(std::make_shared<Node>(SubStatement));
+			stack.push_back(stack.back()->children.back());
+			++statement_depth;
+			
+		} else if(c == substatement_end) {
+			if(statement_depth <= 1) {
+				throw runtime_error(L"Unmatched ) found.");
+			}
+			
+			// TOKEN: END SUBSTATEMENT
+			//std::wcerr << "END SUB-STATEMENT\n";
+			assert(stack.back()->kind == SubStatement);
+			assert(statement_depth >= 2);
+			stack.pop_back();
+			--statement_depth;
+		
+		// Quote mode
+		} else if(c == quote_begin) {
+			auto node = std::make_shared<Node>(Quote);
+			uint nesting = 1;
+			while(true) {
+				if(!stream.good())
+					throw runtime_error(L"Found unmatched “.");
+				c = stream.get();
+				if(c == quote_begin)
+					++nesting;
+				if(c == quote_end)
+					--nesting;
+				if(nesting == 0)
+					break;
+				node->quote += c;
+			}
+			
+			if(statement_depth == 0) {
+				// TOKEN: BEGIN STATEMENT
+				//std::wcerr << "BEGIN STATEMENT\n";
+				assert(stack.back()->kind == Module || stack.back()->kind == Scope);
+				assert(statement_depth == 0);
+				stack.back()->children.push_back(std::make_shared<Node>(Statement));
+				stack.push_back(stack.back()->children.back());
+				statement_depth = 1;
+			}
+			
+			// TOKEN: QUOTE(content)
+			//std::wcerr << "QUOTE \"" << node->identifier << "\"\n";
+			assert(stack.back()->kind == Statement || stack.back()->kind == SubStatement);
+			stack.back()->children.push_back(node);
+			
+		} else if(c == quote_end) {
+			throw runtime_error(L"Found unmatched ”.");
+		
+		// Identifier mode
 		} else {
-			++toColumn;
+			auto node = std::make_shared<Node>(Identifier);
+			node->identifier += c;
+			while(true) {
+				if(!stream.good())
+					break;
+				c = stream.peek();
+				if(c == statement_separator || c == identifier_separator || c == substatement_end)
+					break;
+				c = stream.get();
+				if(c == quote_begin || c == quote_end || c == indentation)
+					throw runtime_error(L"Unexpected character.");
+				node->identifier += c;
+			}
+			
+			if(statement_depth == 0) {
+				// TOKEN: BEGIN STATEMENT
+				//std::wcerr << "BEGIN STATEMENT\n";
+				assert(stack.back()->kind == Module || stack.back()->kind == Scope);
+				assert(statement_depth == 0);
+				stack.back()->children.push_back(std::make_shared<Node>(Statement));
+				stack.push_back(stack.back()->children.back());
+				statement_depth = 1;
+			}
+			
+			// TOKEN: IDENTIFIER(content)
+			//std::wcerr << "IDENTIFIER " << node->identifier << "\n";
+			assert(stack.back()->kind == Statement || stack.back()->kind == SubStatement);
+			stack.back()->children.push_back(node);
+		}
+	}
+	if(statement_depth == 1) {
+		// TOKEN: END STATEMENT
+		//std::wcerr << "END STATEMENT\n";
+		assert(stack.back()->kind == Statement);
+		stack.pop_back();
+	}
+	while(indentation_depth--) {
+		// TOKEN: END SCOPE
+		//std::wcerr << "END SCOPE\n";
+		assert(stack.back()->kind == Scope);
+		stack.pop_back();
+	}
+	
+	// TOKEN: END MODULE
+	//std::wcerr << "END MODULE\n";
+	assert(stack.back()->kind == Module);
+	return stack.back();
+}
+
+std::shared_ptr<Node> parseFile(const std::wstring& filename)
+{
+	std::wifstream stream(encodeLocal(filename));
+	std::shared_ptr<Node> n = lexer(stream);
+	n->filename = filename;
+	parse(n);
+	return n;
+}
+
+std::shared_ptr<Node> parseString(const std::wstring& contents)
+{
+	std::wstringstream stream(contents);
+	std::shared_ptr<Node> n = lexer(stream);
+	n->filename = L"<string>";
+	parse(n);
+	return n;
+}
+
+std::shared_ptr<Node> paserStream(std::wistream& stream)
+{
+	std::shared_ptr<Node> n = lexer(stream);
+	n->filename = L"<stream>";
+	parse(n);
+	return n;
+}
+
+void visit(std::shared_ptr<Node> node, std::function<void(Node&)> visitor)
+{
+	visitor(*node);
+	for(const std::shared_ptr<Node>& child: node->children)
+		visit(child, visitor);
+}
+
+void visit(Stack& stack, std::function<void(const Stack&)> visitor)
+{
+	visitor(stack);
+	const std::shared_ptr<Node>& node = stack.back();
+	for(const std::shared_ptr<Node>& child: node->children) {
+		stack.push_back(child);
+		visit(stack, visitor);
+		stack.pop_back();
+	}
+}
+
+void visit(std::shared_ptr<Node>node, std::function<void(const Stack&)> visitor)
+{
+	Stack stack;
+	stack.push_back(node);
+	visit(stack, visitor);
+}
+
+void tag(std::shared_ptr<Node> module)
+{
+	visit(module, [](Node& node) {
+		if((node.kind == Statement || node.kind == SubStatement)
+			&& node.children.size() >= 1
+			&& node.children[0]->kind == Identifier
+			&& node.children[0]->identifier.size() == 1
+			&& node.children[0]->identifier[0] == closure) {
+			node.is_closure = true;
+			node.children[0]->is_closure = true;
+			for(uint i = 1; i < node.children.size(); ++i) {
+				node.children[i]->is_binding_site = true;
+			}
+		}
+	});
+}
+
+void deanonymize(std::shared_ptr<Node> module)
+{
+	// Give all substatements a unique identifier.
+	uint counter = 1;
+	const std::wstring base(L"anon-");
+	visit(module, [&](Node& node) {
+		if(node.kind == SubStatement) {
+			std::wstringstream name;
+			name << base;
+			name << counter;
+			node.identifier = name.str();
+			++counter;
+		}
+	});
+}
+
+void undebruijn(std::shared_ptr<Node> module)
+{
+	constexpr uint none = std::numeric_limits<uint>().max();
+	visit(module, [](const Stack& stack) {
+		const std::shared_ptr<Node>& node = stack.back();
+		if(node->kind == Identifier
+			&& node->identifier.size() == 1) {
+			uint number = none;
+			switch(node->identifier[0]) {
+				case de_bruijn_1: number = 1; break;
+				case de_bruijn_2: number = 2; break;
+				default: break;
+			}
+			if(number != none) {
+				assert(number < stack.size());
+				const uint index = stack.size() - number - 1;
+				assert(stack[index]->kind = SubStatement);
+				
+				if(node->is_binding_site) {
+					assert(!stack[index]->is_binding_site);
+					stack[index]->binding_site = node;
+					stack[index]->is_substatement_bound = true;
+				} else {
+					assert(stack[index]->is_binding_site);
+					node->binding_site = stack[index];
+					stack[index]->is_substatement_bound = true;
+				}
+			}
+		}
+	});
+}
+
+std::shared_ptr<Node> find_symbol(const std::wstring& identifier, std::shared_ptr<Node> node)
+{
+	if(node->kind == Identifier
+		&& node->is_binding_site
+		&& node->identifier == identifier)
+		return node;
+	if(node->kind == Statement || node->kind == SubStatement) {
+		for(std::shared_ptr<Node> child: node->children) {
+			std::shared_ptr<Node> binding_site = find_symbol(identifier, child);
+			if(binding_site)
+				return binding_site;
+		}
+	}
+	return std::shared_ptr<Node>();
+}
+
+void bind(std::shared_ptr<Node> module)
+{
+	// Bind identifiers
+	visit(module, [](const Stack& stack) {
+		const std::shared_ptr<Node>& node = stack.back();
+		if(node->kind != Identifier || node->is_binding_site || node->is_closure
+			|| node->binding_site.lock())
+			return;
+		
+		// Id node
+		const std::shared_ptr<Node> id_node = node;
+		const std::wstring id = id_node->identifier;
+		
+		// Binding node
+		std::shared_ptr<Node> binding_node;
+		
+		// Go up the stack
+		assert(stack.size() >= 2);
+		uint stack_index = stack.size() - 2;
+		
+		while(stack_index < stack.size()) {
+			
+			// Find out position in the stack
+			const std::shared_ptr<Node> child = stack[stack_index + 1];
+			const std::shared_ptr<Node> parent = stack[stack_index];
+			uint child_index = std::distance(parent->children.begin(), std::find(
+				parent->children.begin(), parent->children.end(), child));
+			assert(child_index < parent->children.size());
+			
+			// Scan backward
+			for(uint i = child_index - 1; i < parent->children.size(); --i) {
+				binding_node = find_symbol(id, parent->children[i]);
+				if(binding_node)
+					break;
+			}
+			if(binding_node)
+				break;
+			
+			// Scan forward
+			for(uint i = child_index + 1; i < parent->children.size(); ++i) {
+				binding_node = find_symbol(id, parent->children[i]);
+				if(binding_node)
+					break;
+			}
+			if(binding_node)
+				break;
+				
+			// Go up and try again
+			--stack_index;
+		}
+		
+		// Upsert a global symbol
+		if(!binding_node) {
+			std::shared_ptr<Node> module = stack[0];
+			assert(module->kind == Module);
+			
+			for(std::shared_ptr<Node> global: module->globals) {
+				if(global->identifier == id) {
+					binding_node = global;
+					break;
+				}
+			}
+			if(!binding_node) {
+				binding_node = std::make_shared<Node>(Identifier);
+				binding_node->identifier = id;
+				binding_node->is_binding_site = true;
+				module->globals.push_back(binding_node);
+			}
+		}
+		
+		// Bind  the node
+		assert(binding_node);
+		id_node->binding_site = binding_node;
+		
+	});
+}
+
+void parse(std::shared_ptr<Node> module)
+{
+	tag(module);
+	deanonymize(module);
+	undebruijn(module);
+	bind(module);
+}
+
+void print(std::shared_ptr<Node> module)
+{
+	uint i = 0;
+	std::function<void(const Parser::Node& n)> r = [&](const Parser::Node& n) -> void {
+		
+		for(uint j = 0; j < i; ++j)
+			std::wcerr << "\t";
+		if(n.kind == Parser::Module)
+			std::wcerr << "Module";
+		if(n.kind == Parser::Scope)
+			std::wcerr << "Scope";
+		if(n.kind == Parser::Statement)
+			std::wcerr << "Statement";
+		if(n.kind == Parser::SubStatement)
+			std::wcerr << "SubStatement";
+		if(n.kind == Parser::Identifier)
+			std::wcerr << "Identifier";
+		if(n.kind == Parser::Quote)
+			std::wcerr << "Quote";
+		std::wcerr << " " << n.quote << n.identifier << n.filename;
+		if(n.is_binding_site)
+			std::wcerr << " binding";
+		if(std::shared_ptr<Parser::Node> site = n.binding_site.lock())
+			std::wcerr << " bound to " << site->identifier;
+		std::wcerr << "\n";
+		
+		++i;
+		for(const std::shared_ptr<Parser::Node>& c: n.globals)
+			r(*c);
+		for(const std::shared_ptr<Parser::Node>& c: n.children)
+			r(*c);
+		--i;
+	};
+	r(*module);
+}
+
+// TODO: (λ · (print “0” ret)) produces a lambda of arity one, but
+//       we can equally argue it should be a lambda of arity two that
+//       ignores its argument. (Although this can also be done as
+//       (λ · _ (print “0” ret))
+
+uint count_arguments(const Node& node)
+{
+	uint count = node.children.size();
+	for(const auto& child: node.children)
+		if(child->kind == SubStatement && !child->is_substatement_bound)
+			--count;
+	count -= node.is_closure ? 2 : 1;
+	return count;
+}
+
+Program compile(std::shared_ptr<Node> module)
+{
+	Program p;
+	
+	// Add unresolved symbols to p.symbols_import
+	for(auto i: module->globals) {
+		p.symbols_import.push_back(i->identifier);
+		const Symbol symbol = std::make_pair(0, p.symbols_import.size() - 1);
+		i->bind_index = symbol;
+		p.symbols[symbol] = i->identifier;
+	}
+	
+	// Add top level symbols to p.symbols_export
+	for(auto i: module->children) {
+		Node& node = *i;
+		if((node.kind == Statement || node.kind == SubStatement)
+			&& node.is_closure
+			&& node.children.size() > 2
+			&& node.children[1]->kind == Identifier) {
+			if(std::find(p.symbols_export.begin(), p.symbols_export.end(),
+				node.children[1]->identifier) != p.symbols_export.end())
+				continue;
+			p.symbols_export.push_back(node.children[1]->identifier);
+			p.closures.push_back(count_arguments(node));
+			node.closure_index = p.closures.size() + 1;
+			for(uint i = 1; i < node.children.size(); ++i)
+				node.children[i]->bind_index = std::make_pair(node.closure_index, i - 1);
 		}
 	}
 	
-	/// TODO: Fix line and col number
-	int fromLine = _token->line_number();
-	int fromColumn = _token->column_number();
-	int toLine = fromLine;
-	fromLine -= num_lines;
-	SourceProperty location(_filename, fromLine, fromColumn, toLine, toColumn);
+	// Add all other closures
+	visit(module, [&](Node& node) {
+		if(node.kind == Statement || node.kind == SubStatement) {
+			if(node.is_closure && node.closure_index == 0) {
+				p.closures.push_back(count_arguments(node));
+				node.closure_index = p.closures.size() + 1;
+				for(uint i = 1; i < node.children.size(); ++i)
+					node.children[i]->bind_index = std::make_pair(node.closure_index, i - 1);
+			}
+		}
+	});
 	
-	ParseTree::Constant* constant = new ParseTree::Constant(Value{contents});
-	constant->source(source(true));
-	return constant;
+	// Add all the calls
+	visit(module, [&](Node& node) {
+		if(node.kind == Statement || node.kind == SubStatement) {
+			if(!node.is_closure) {
+				std::vector<std::pair<uint,uint>> call;
+				for(std::shared_ptr<Node> c: node.children) {
+					if(c->kind == SubStatement && !c->is_substatement_bound)
+						continue;
+					if(c->kind == Quote) {
+						p.constants.push_back(c->quote);
+						call.push_back(std::make_pair(1, p.constants.size() - 1));
+						continue;
+					}
+					std::shared_ptr<Node> bind = c->binding_site.lock();
+					assert(bind);
+					call.push_back(bind->bind_index);
+				}
+				node.call_index = p.calls.size();
+				p.calls.push_back(call);
+			}
+		}
+	});
+	
+	// Add all the symbols and their identifiers (this is debug info)
+	visit(module, [&](Node& node) {
+		if(node.kind == Identifier) {
+			p.symbols[node.bind_index] = node.identifier;
+		}
+	});
+	// std::wcerr << p.symbols << "\n";
+	
+	// Associate closures with calls
+	// The associated call is the first call after the closure.
+	// Note: This implies that closures and calls alternate
+	constexpr uint none = std::numeric_limits<uint>().max();
+	p.closure_call.resize(p.calls.size(), none);
+	uint current_closure_index = none;
+	visit(module, [&](Node& node) {
+		if(node.kind == Statement || node.kind == SubStatement) {
+			if(node.is_closure) {
+				assert(current_closure_index == none);
+				current_closure_index = node.closure_index - 2;
+			} else {
+				if(current_closure_index != none) {
+					p.closure_call[current_closure_index] = node.call_index;
+					current_closure_index = none;
+				} else {
+					// std::wcerr << "Unassociated call" << "\n";
+				}
+			}
+		}
+	});
+	
+	return p;
 }
 
+void write(std::wostream& out, const Program& p)
+{
+	for(uint i = 0; i < p.symbols_import.size(); ++i) {
+		out << p.symbols_import[i];
+		if(i != p.symbols_import.size() - 1)
+			out << " ";
+	}
+	out << "\n";
+	for(uint i = 0; i < p.symbols_export.size(); ++i) {
+		out << p.symbols_export[i];
+		if(i != p.symbols_export.size() - 1)
+			out << " ";
+	}
+	out << "\n";
+	out << p.constants.size() << "\n";
+	for(const auto s: p.constants)
+		out << s.size() << " " << s << "\n";
+	for(uint i = 0; i < p.closures.size(); ++i) {
+		out << p.closures[i];
+		if(i != p.closures.size() - 1)
+			out << " ";
+	}
+	out << "\n";
+	for(uint i = 0; i < p.closure_call.size(); ++i) {
+		out << p.closure_call[i];
+		if(i != p.closure_call.size() - 1)
+			out << " ";
+	}
+	out << "\n";
+	for(const auto s: p.calls) {
+		for(uint i = 0; i < s.size(); ++i) {
+			out << s[i].first << " " << s[i].second;
+			if(i != s.size() - 1)
+				out << " ";
+		}
+		out << "\n";
+	}
+}
+
+Program read(std::wistream& in)
+{
+	// TODO
+	return Program();
+}
+
+} // namespace Parser
